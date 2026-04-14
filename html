@@ -354,11 +354,38 @@
         };
 
         // =========================================================
-        // 3. UI HELPERS
+        // 3. FIREBASE MULTIPLAYER INIT
         // =========================================================
-        function safeSetText(id, text) { const el = document.getElementById(id); if(el) el.innerText = text; }
-        function safeSetDisplay(id, disp) { const el = document.getElementById(id); if(el) el.style.display = disp; }
-        function safeAddClick(id, fn) { const el = document.getElementById(id); if(el) el.addEventListener('click', fn); }
+        async function initFirebase() {
+            try {
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token).catch(() => signInAnonymously(auth));
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                return new Promise(resolve => {
+                    onAuthStateChanged(auth, (user) => {
+                        if (user) { myId = user.uid; resolve(true); }
+                    });
+                });
+            } catch(e) {
+                console.warn("Firebase config not found, running offline mode.");
+                myId = "local_" + Math.random().toString(36).substr(2, 9);
+                return true; 
+            }
+        }
+
+        window.addEventListener('beforeunload', () => {
+            if (db && myId) {
+                setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'players', myId), { timestamp: 0 }, { merge: true });
+            }
+        });
 
         // =========================================================
         // 4. ACCESSORIES & AVATAR BUILDER
@@ -622,28 +649,69 @@
         buildLevels();
 
         // =========================================================
-        // 7. FIREBASE SYNC & MULTIPLAYER
+        // 7. COMBAT & ITEMS LOGIC
         // =========================================================
-        async function initFirebase() {
-            try {
-                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-                app = initializeApp(firebaseConfig); auth = getAuth(app); db = getFirestore(app);
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) await signInWithCustomToken(auth, __initial_auth_token).catch(() => signInAnonymously(auth));
-                else await signInAnonymously(auth);
-                return new Promise(resolve => onAuthStateChanged(auth, (user) => { if (user) { myId = user.uid; resolve(true); } }));
-            } catch(e) {
-                myId = "local_" + Math.random().toString(36).substr(2, 9); return true; 
+        function rollItem() {
+            const r = Math.random();
+            if (r < 0.25) return ITEMS.BOOST; if (r < 0.50) return ITEMS.MINE; if (r < 0.75) return ITEMS.FREEZE; return ITEMS.WARP;
+        }
+
+        function updateItemUI() {
+            document.getElementById('item-slot').innerText = ITEM_EMOJIS[currentItem];
+            if(localPlayer) {
+                localPlayer.droneItem.visible = currentItem !== ITEMS.NONE;
+                if(currentItem === ITEMS.BOOST) localPlayer.droneItem.material.color.setHex(0xffaa00);
+                if(currentItem === ITEMS.MINE) localPlayer.droneItem.material.color.setHex(0xff0000);
+                if(currentItem === ITEMS.FREEZE) localPlayer.droneItem.material.color.setHex(0x00ffff);
+                if(currentItem === ITEMS.WARP) localPlayer.droneItem.material.color.setHex(0xd946ef);
             }
         }
-        window.addEventListener('beforeunload', () => { if (db && myId) setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'players', myId), { timestamp: 0 }, { merge: true }); });
 
-        var lastHandledEventTs = {}; var roomCmdTs = 0; var pendingEvent = null;
+        function useItem() {
+            if (currentItem === ITEMS.NONE || isFrozen || isStunned) return;
+
+            if (currentItem === ITEMS.BOOST) {
+                hasBoost = true; boostTimer = 4000; showFloatingText("OVERDRIVE!", playerGrp.position, "#ffaa00"); syncEvent('use_boost');
+            } else if (currentItem === ITEMS.MINE) {
+                const pos = playerGrp.position.clone(); spawnMine(myId, pos); syncEvent('spawn_mine', { x: pos.x, y: pos.y, z: pos.z });
+            } else if (currentItem === ITEMS.FREEZE) {
+                const pos = playerGrp.position.clone(); pos.y += 2;
+                const dir = new THREE.Vector3(0,0,-1).applyQuaternion(playerGrp.quaternion);
+                spawnProjectile(myId, pos, dir); syncEvent('spawn_projectile', { x: pos.x, y: pos.y, z: pos.z, dx: dir.x, dz: dir.z });
+            } else if (currentItem === ITEMS.WARP) {
+                const dir = new THREE.Vector3(0,0,-1).applyQuaternion(playerGrp.quaternion);
+                playerGrp.position.add(dir.multiplyScalar(50)); playerGrp.position.y += 10; velocity.set(0,0,0);
+                showFloatingText("WARP JUMP!", playerGrp.position, "#d946ef");
+            }
+            currentItem = ITEMS.NONE; updateItemUI();
+        }
+
+        function spawnMine(ownerId, pos) {
+            const mine = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 2, 1, 16), MATS.mine); mine.position.copy(pos); mine.position.y += 0.5; scene.add(mine);
+            dynamicObjects.push({ type: 'mine', mesh: mine, owner: ownerId, active: true });
+        }
+
+        function spawnProjectile(ownerId, pos, dir) {
+            const proj = new THREE.Mesh(new THREE.SphereGeometry(1.5, 8, 8), MATS.ice); proj.position.copy(pos); scene.add(proj);
+            const pVel = dir.multiplyScalar(3.0); dynamicObjects.push({ type: 'projectile', mesh: proj, owner: ownerId, vel: pVel, active: true, life: 150 });
+        }
+
+        function applyStun() { isStunned = true; stunTimer = 2000; velocity.y = 1.5; velocity.x = 0; velocity.z = 0; showFloatingText("STUNNED!", playerGrp.position, "#ff0000"); }
+        function applyFreeze() { isFrozen = true; freezeTimer = 3000; velocity.set(0,0,0); localPlayer.iceBlock.visible = true; document.getElementById('freeze-overlay').style.display = 'block'; showFloatingText("FROZEN!", playerGrp.position, "#00ffff"); }
+
+        // =========================================================
+        // 8. FIREBASE SYNC & MULTIPLAYER
+        // =========================================================
+        var lastHandledEventTs = {};
+        var roomCmdTs = 0;
+        var pendingEvent = null;
 
         function syncEvent(eventType, payload={}) { pendingEvent = { type: eventType, ts: Date.now(), ...payload }; syncLocalPlayer(true); }
 
         function setupMultiplayerListeners() {
             if (!db) return;
-            onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode), (snap) => {
+            const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomCode);
+            onSnapshot(roomRef, (snap) => {
                 if (!snap.exists()) return;
                 const data = snap.data();
                 if (data.ts > roomCmdTs) {
@@ -654,15 +722,16 @@
                         if (startBarrier) { scene.remove(startBarrier); startBarrier = null; }
                         showFloatingText("GO!", playerGrp.position, "#d946ef");
                     } else if (data.cmd === 'reset') {
-                        raceStarted = false; raceFinished = false; safeSetText('timer', "WAITING");
+                        raceStarted = false; raceFinished = false; document.getElementById('timer').innerText = "WAITING";
                         currentStage = 1; respawnPoint.set(0, 10, 0); dieAndRespawn("ADMIN RESET");
-                        leaderboard = []; updateLeaderboardUI(); safeSetDisplay('race-message', 'none');
+                        leaderboard = []; updateLeaderboardUI(); document.getElementById('race-message').style.display = 'none';
                         if (!startBarrier) { startBarrier = new THREE.Mesh(new THREE.PlaneGeometry(40, 30), MATS.barrier); startBarrier.position.set(0, 15, -20); scene.add(startBarrier); }
                     }
                 }
             });
 
-            onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'players'), (snap) => {
+            const playersRef = collection(db, 'artifacts', appId, 'public', 'data', 'players');
+            onSnapshot(playersRef, (snap) => {
                 const now = Date.now();
                 snap.forEach(docSnap => {
                     const data = docSnap.data();
@@ -690,7 +759,12 @@
                         else if (ev.type === 'finish') updateLeaderboard(docSnap.id, data.name, ev.time);
                     }
                 });
-                remotePlayers.forEach((p, id) => { if (now - p.lastSeen > 10000) { scene.remove(p.model.group); remotePlayers.delete(id); updatePlayersUI(); } });
+
+                remotePlayers.forEach((p, id) => {
+                    if (now - p.lastSeen > 10000) {
+                        scene.remove(p.model.group); remotePlayers.delete(id); updatePlayersUI();
+                    }
+                });
             }, (err) => console.warn(err));
         }
 
@@ -710,6 +784,7 @@
                 state: state, item: currentItem, hasBoost, isFrozen, timestamp: now
             };
             if (pendingEvent) { payload.lastEvent = pendingEvent; pendingEvent = null; }
+
             setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'players', myId), payload).catch(e => {});
         }
 
@@ -719,36 +794,7 @@
         }
 
         // =========================================================
-        // 8. COMBAT & ITEMS LOGIC
-        // =========================================================
-        function rollItem() { const r = Math.random(); if (r < 0.25) return ITEMS.BOOST; if (r < 0.50) return ITEMS.MINE; if (r < 0.75) return ITEMS.FREEZE; return ITEMS.WARP; }
-        function updateItemUI() {
-            safeSetText('item-slot', ITEM_EMOJIS[currentItem]);
-            if(localPlayer) {
-                localPlayer.droneItem.visible = currentItem !== ITEMS.NONE;
-                if(currentItem === ITEMS.BOOST) localPlayer.droneItem.material.color.setHex(0xffaa00);
-                if(currentItem === ITEMS.MINE) localPlayer.droneItem.material.color.setHex(0xff0000);
-                if(currentItem === ITEMS.FREEZE) localPlayer.droneItem.material.color.setHex(0x00ffff);
-                if(currentItem === ITEMS.WARP) localPlayer.droneItem.material.color.setHex(0xd946ef);
-            }
-        }
-
-        function useItem() {
-            if (currentItem === ITEMS.NONE || isFrozen || isStunned) return;
-            if (currentItem === ITEMS.BOOST) { hasBoost = true; boostTimer = 4000; showFloatingText("OVERDRIVE!", playerGrp.position, "#ffaa00"); syncEvent('use_boost'); } 
-            else if (currentItem === ITEMS.MINE) { spawnMine(myId, playerGrp.position.clone()); syncEvent('spawn_mine', { x: playerGrp.position.x, y: playerGrp.position.y, z: playerGrp.position.z }); } 
-            else if (currentItem === ITEMS.FREEZE) { const pos = playerGrp.position.clone(); pos.y += 2; const dir = new THREE.Vector3(0,0,-1).applyQuaternion(playerGrp.quaternion); spawnProjectile(myId, pos, dir); syncEvent('spawn_projectile', { x: pos.x, y: pos.y, z: pos.z, dx: dir.x, dz: dir.z }); } 
-            else if (currentItem === ITEMS.WARP) { const dir = new THREE.Vector3(0,0,-1).applyQuaternion(playerGrp.quaternion); playerGrp.position.add(dir.multiplyScalar(50)); playerGrp.position.y += 10; velocity.set(0,0,0); showFloatingText("WARP JUMP!", playerGrp.position, "#d946ef"); }
-            currentItem = ITEMS.NONE; updateItemUI();
-        }
-
-        function spawnMine(ownerId, pos) { const mine = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 2, 1, 16), MATS.mine); mine.position.copy(pos); mine.position.y += 0.5; scene.add(mine); dynamicObjects.push({ type: 'mine', mesh: mine, owner: ownerId, active: true }); }
-        function spawnProjectile(ownerId, pos, dir) { const proj = new THREE.Mesh(new THREE.SphereGeometry(1.5, 8, 8), MATS.ice); proj.position.copy(pos); scene.add(proj); const pVel = dir.multiplyScalar(3.0); dynamicObjects.push({ type: 'projectile', mesh: proj, owner: ownerId, vel: pVel, active: true, life: 150 }); }
-        function applyStun() { isStunned = true; stunTimer = 2000; velocity.y = 1.5; velocity.x = 0; velocity.z = 0; showFloatingText("STUNNED!", playerGrp.position, "#ff0000"); }
-        function applyFreeze() { isFrozen = true; freezeTimer = 3000; velocity.set(0,0,0); localPlayer.iceBlock.visible = true; safeSetDisplay('freeze-overlay', 'block'); showFloatingText("FROZEN!", playerGrp.position, "#00ffff"); }
-
-        // =========================================================
-        // 9. LOBBY UI LOGIC
+        // 9. LOBBY UI & CHAT
         // =========================================================
         async function hostRoom() {
             const inputName = document.getElementById('player-name');
@@ -759,11 +805,11 @@
             isHost = true; setupMultiplayerListeners();
 
             showMenu('host-menu');
-            safeSetText('display-code', roomCode);
-            safeSetText('display-link', window.location.href.split('?')[0] + "?room=" + roomCode);
-            safeSetText('hud-code-display', roomCode);
-            safeSetDisplay('host-panel', 'block'); 
-            safeSetDisplay('chat-lobby-box', 'flex');
+            document.getElementById('display-code').innerText = roomCode;
+            document.getElementById('display-link').innerText = window.location.href.split('?')[0] + "?room=" + roomCode;
+            document.getElementById('hud-code-display').innerText = roomCode;
+            document.getElementById('host-panel').style.display = 'block'; 
+            document.getElementById('chat-lobby-box').style.display = 'flex';
             appendChat("System", "Room Created. Waiting for players...", "#94a3b8");
         }
 
@@ -772,16 +818,16 @@
             myName = (inputName && inputName.value) ? inputName.value : "RACER";
             code = code.toUpperCase(); roomCode = code;
             
-            showMenu('loading-menu'); safeSetText('loading-text', `JOINING ${code}...`);
+            showMenu('loading-menu'); document.getElementById('loading-text').innerText = `JOINING ${code}...`;
             await initFirebase();
             isHost = false; setupMultiplayerListeners();
 
             showMenu('host-menu');
-            safeSetText('display-code', roomCode);
-            safeSetText('display-link', window.location.href.split('?')[0] + "?room=" + roomCode);
-            safeSetText('hud-code-display', roomCode);
-            safeSetDisplay('chat-lobby-box', 'flex');
-            safeSetDisplay('btn-start', 'none'); 
+            document.getElementById('display-code').innerText = roomCode;
+            document.getElementById('display-link').innerText = window.location.href.split('?')[0] + "?room=" + roomCode;
+            document.getElementById('hud-code-display').innerText = roomCode;
+            document.getElementById('chat-lobby-box').style.display = 'flex';
+            document.getElementById('btn-start').style.display = 'none'; 
             appendChat("System", "Connected to Room! Waiting for host to start.", "#94a3b8");
         }
 
@@ -792,8 +838,10 @@
             appendChat(myName, val, "#" + myAvatarColor.toString(16).padStart(6,'0'));
             syncEvent('chat', { text: val });
             inputEl.value = "";
-            if (inputId === 'ig-chat-input') { window.isTyping = false; safeSetDisplay('ig-chat-input-container', 'none'); }
+            if (inputId === 'ig-chat-input') { window.isTyping = false; document.getElementById('ig-chat-input-container').style.display = 'none'; }
         }
+        
+        document.getElementById('btn-send-chat').addEventListener('click', () => sendChatFromInput('chat-input'));
         
         function appendChat(name, text, color) {
             const html = `<div class="chat-msg"><span class="chat-name" style="color:${color}">${name}:</span> ${text}</div>`;
@@ -801,7 +849,7 @@
             const boxIG = document.getElementById('ig-chat-messages'); if(boxIG) { boxIG.innerHTML += html; boxIG.scrollTop = boxIG.scrollHeight; }
         }
 
-        function updatePlayersUI() { safeSetText('player-count', remotePlayers.size + 1); }
+        function updatePlayersUI() { document.getElementById('player-count').innerText = remotePlayers.size + 1; }
         function formatTime(ms) { const m = Math.floor(ms/60000); const s = Math.floor((ms%60000)/1000); const c = Math.floor((ms%1000)/10); return `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')}.${c.toString().padStart(2,'0')}`; }
 
         function updateLeaderboard(id, nameStr, timeMs) {
@@ -811,8 +859,7 @@
             }
         }
         function updateLeaderboardUI() {
-            const list = document.getElementById('leaderboard-list'); if(!list) return;
-            list.innerHTML = "";
+            const list = document.getElementById('leaderboard-list'); list.innerHTML = "";
             if (leaderboard.length === 0) list.innerHTML = `<div class="leaderboard-entry" style="color:#64748b;">Waiting...</div>`;
             leaderboard.forEach((e, i) => {
                 const el = document.createElement('div'); el.className = 'leaderboard-entry';
@@ -827,8 +874,7 @@
             let racers = [{ id: myId, name: "YOU", z: playerGrp.position.z }];
             remotePlayers.forEach((p, id) => racers.push({ id, name: p.name, z: p.progressZ || 0 }));
             racers.sort((a,b) => a.z - b.z);
-            const list = document.getElementById('leaderboard-list'); if(!list) return;
-            list.innerHTML = "";
+            const list = document.getElementById('leaderboard-list'); list.innerHTML = "";
             racers.slice(0,5).forEach((e, i) => {
                 const el = document.createElement('div'); el.className = 'leaderboard-entry';
                 if (e.id === myId) el.style.color = '#d946ef';
@@ -838,40 +884,39 @@
         }
 
         function showMenu(id) {
-            ['setup-menu', 'host-menu', 'loading-menu'].forEach(m => safeSetDisplay(m, 'none'));
-            if(id) safeSetDisplay(id, 'block');
+            ['setup-menu', 'host-menu', 'loading-menu'].forEach(m => document.getElementById(m).style.display = 'none');
+            if(id) document.getElementById(id).style.display = 'block';
         }
 
-        // Add Safe Listeners
-        safeAddClick('btn-create', hostRoom);
-        safeAddClick('btn-join', () => { const el = document.getElementById('join-input'); if(el && el.value.trim()) joinRoom(el.value.trim()); });
-        safeAddClick('btn-copy', () => { const el = document.getElementById('display-link'); if(el) navigator.clipboard.writeText(el.innerText); });
-        safeAddClick('btn-send-chat', () => sendChatFromInput('chat-input'));
+        document.getElementById('btn-create').addEventListener('click', hostRoom);
+        document.getElementById('btn-join').addEventListener('click', () => { const code = document.getElementById('join-input').value.trim(); if(code) joinRoom(code); });
+        document.getElementById('btn-copy').addEventListener('click', () => { navigator.clipboard.writeText(document.getElementById('display-link').innerText); });
         
-        safeAddClick('btn-start', () => {
-            if(raceStarted) return; raceStarted = true; raceFinished = false; startTime = Date.now();
-            enterGame(); if (startBarrier) { scene.remove(startBarrier); startBarrier = null; }
-            showFloatingText("RACE STARTED!", playerGrp.position, "#39ff14"); sendHostCommand('start', { startTime: startTime });
-        });
-        safeAddClick('admin-start', () => {
-            if(raceStarted) return; raceStarted = true; raceFinished = false; startTime = Date.now();
+        document.getElementById('btn-start').addEventListener('click', () => {
+            if(raceStarted) return;
+            raceStarted = true; raceFinished = false; startTime = Date.now();
+            enterGame();
             if (startBarrier) { scene.remove(startBarrier); startBarrier = null; }
-            showFloatingText("RACE STARTED!", playerGrp.position, "#39ff14"); sendHostCommand('start', { startTime: startTime });
+            showFloatingText("RACE STARTED!", playerGrp.position, "#39ff14");
+            sendHostCommand('start', { startTime: startTime });
         });
-        safeAddClick('admin-reset', () => sendHostCommand('reset'));
 
-        const chatInputLobby = document.getElementById('chat-input');
-        if(chatInputLobby) chatInputLobby.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendChatFromInput('chat-input'); });
-        
-        const chatInputIG = document.getElementById('ig-chat-input');
-        if(chatInputIG) chatInputIG.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendChatFromInput('ig-chat-input'); });
+        document.getElementById('admin-start').addEventListener('click', () => {
+            if(raceStarted) return;
+            raceStarted = true; raceFinished = false; startTime = Date.now();
+            if (startBarrier) { scene.remove(startBarrier); startBarrier = null; }
+            showFloatingText("RACE STARTED!", playerGrp.position, "#39ff14");
+            sendHostCommand('start', { startTime: startTime });
+        });
+        document.getElementById('admin-reset').addEventListener('click', () => { sendHostCommand('reset'); });
 
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.get('room')) joinRoom(urlParams.get('room'));
 
         function enterGame() {
             if (window.gameActive) return; window.gameActive = true;
-            safeSetDisplay('lobby', 'none'); safeSetDisplay('ui-container', 'block');
+            document.getElementById('lobby').style.display = 'none'; 
+            document.getElementById('ui-container').style.display = 'block';
             
             previewGrp.visible = false;
             localPlayer = createAvatar(myAvatarColor, myAvatarClass, myName, myAccessoryId); scene.add(localPlayer.group); playerGrp = localPlayer.group;
@@ -919,7 +964,7 @@
             if(!playerGrp) return;
             playerGrp.position.copy(respawnPoint); velocity.set(0,0,0);
             isFrozen = false; isStunned = false; hasBoost = false; sprintStamina = MAX_SPRINT;
-            localPlayer.iceBlock.visible = false; safeSetDisplay('freeze-overlay', 'none');
+            localPlayer.iceBlock.visible = false; document.getElementById('freeze-overlay').style.display='none';
             showFloatingText(msg, playerGrp.position, "#ef4444");
         }
 
@@ -951,12 +996,12 @@
 
             if(!playerGrp || !localPlayer) return; 
 
-            if (raceStarted && !raceFinished) { safeSetText('timer', formatTime(time - startTime)); if(time % 30 === 0) updateLiveRanks(); }
-            safeSetText('stage-indicator', `STAGE ${currentStage} / 5`);
+            if (raceStarted && !raceFinished) { document.getElementById('timer').innerText = formatTime(time - startTime); if(time % 30 === 0) updateLiveRanks(); }
+            document.getElementById('stage-indicator').innerText = `STAGE ${currentStage} / 5`;
             
             if (boostTimer > 0) { boostTimer -= 16; if(boostTimer <= 0) hasBoost = false; }
             if (stunTimer > 0) { stunTimer -= 16; if(stunTimer <= 0) isStunned = false; }
-            if (freezeTimer > 0) { freezeTimer -= 16; if(freezeTimer <= 0) { isFrozen = false; localPlayer.iceBlock.visible = false; safeSetDisplay('freeze-overlay', 'none'); } }
+            if (freezeTimer > 0) { freezeTimer -= 16; if(freezeTimer <= 0) { isFrozen = false; localPlayer.iceBlock.visible = false; document.getElementById('freeze-overlay').style.display='none'; } }
 
             const isSprinting = (keys['ShiftLeft'] || keys['ShiftRight']) && sprintStamina > 0 && isGrounded && !window.isTyping;
             if (isSprinting) sprintStamina = Math.max(0, sprintStamina - SPRINT_DRAIN);
@@ -1019,7 +1064,8 @@
                     velocity.x = THREE.MathUtils.lerp(velocity.x, moveVec.x * speed, isGrounded ? 0.6 : 0.3);
                     velocity.z = THREE.MathUtils.lerp(velocity.z, moveVec.z * speed, isGrounded ? 0.6 : 0.3);
 
-                    const targetAngle = Math.atan2(velocity.x, velocity.z);
+                    // Add Math.PI to rotation logic to properly face direction of movement without looking backwards
+                    const targetAngle = Math.atan2(velocity.x, velocity.z) + Math.PI;
                     let diff = targetAngle - playerGrp.rotation.y;
                     while(diff < -Math.PI) diff += Math.PI*2; while(diff > Math.PI) diff -= Math.PI*2;
                     playerGrp.rotation.y += diff * 0.4; 
@@ -1079,7 +1125,8 @@
                 }
                 else if (stoodOn.type === 'finish' && raceStarted && !raceFinished) {
                     raceFinished = true; finishedTimeMs = time - startTime;
-                    safeSetText('race-message', `FINISHED!\n${formatTime(finishedTimeMs)}`); safeSetDisplay('race-message', 'block');
+                    document.getElementById('race-message').innerText = `FINISHED!\n${formatTime(finishedTimeMs)}`;
+                    document.getElementById('race-message').style.display = 'block';
                     updateLeaderboard(myId, myName, finishedTimeMs); syncEvent('finish', { time: finishedTimeMs });
                 }
             }
@@ -1102,6 +1149,7 @@
                 }
             }
 
+            // Animations
             let state = 'idle';
             if (isFrozen) state = 'frozen'; else if (isStunned) state = 'stun'; else if (!isGrounded) state = 'jump'; else if (Math.abs(velocity.x) > 0.05 || Math.abs(velocity.z) > 0.05) state = 'walk';
 
